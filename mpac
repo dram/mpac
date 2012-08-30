@@ -52,7 +52,7 @@ class Mpac(object):
                           ]:
             for op in ops:
                 subparsers.add_parser(op,
-                                      add_help=False).set_defaults(func=cmd.cmd)
+                                      add_help=False).set_defaults(func=cmd.run)
 
         return parser.parse_known_args()
 
@@ -184,11 +184,22 @@ class Cmd():
     def __init__(self, media):
         self._media = media
 
-    def cmd(self, args):
+    def run(self, args):
+        cmd = self._cmd(args)
+        if not isinstance(cmd, list):
+            return
+
+        cmds = cmd if isinstance(cmd[0], list) else [cmd]
+
+        for cmd in cmds:
+            subprocess.call(cmd)
+
+    def _cmd(self, args):
         raise NotImplementedError
+    
 
 class CmdSearch(Cmd):
-    def cmd(self, args):
+    def run(self, args):
         parser = argparse.ArgumentParser(prog='mpac search')
         parser.add_argument('pattern')
         parser.add_argument('-a', '--all', action='store_true',
@@ -273,7 +284,7 @@ class CmdSearch(Cmd):
 
 
 class CmdQuery(Cmd):
-    def cmd(self, args):
+    def run(self, args):
         parser = argparse.ArgumentParser(prog='mpac query')
         parser.add_argument('name', help='package name')
         parser.add_argument('-a', '--all', action='store_true',
@@ -357,7 +368,7 @@ class CmdQuery(Cmd):
 
 
 class CmdInstall(Cmd):
-    def cmd(self, args):
+    def _cmd(self, args):
         parser = argparse.ArgumentParser(prog='mpac install')
         parser.add_argument('name', nargs='+', help='package name(s)')
         parser.add_argument('-d', '--download-only', action='store_true',
@@ -395,7 +406,7 @@ class CmdInstall(Cmd):
 
         media.update_db()
 
-        self._install(media, opt.name, options)
+        return self._install(media, opt.name, options)
 
     def _install(self, media, names, options):
         """Install package from media.
@@ -415,12 +426,11 @@ class CmdInstall(Cmd):
         names = [p['full_name'] for p in pkgs]
         media = [p['media'] for p in pkgs]
 
-        subprocess.call(['urpmi',
-                         '--searchmedia', ','.join(media)] + options + names)
+        return ['urpmi', '--searchmedia', ','.join(media)] + options + names
 
 
 class CmdErase(Cmd):
-    def cmd(self, args):
+    def _cmd(self, args):
         parser = argparse.ArgumentParser(prog='mpac erase')
         parser.add_argument('name', nargs='+', help='package name')
         parser.add_argument('-r', '--requires', action='store_true',
@@ -428,7 +438,7 @@ class CmdErase(Cmd):
 
         opt = parser.parse_args(args)
 
-        self._erase(opt.name, opt.requires)
+        return self._erase(opt.name, opt.requires)
 
     def _erase(self, names, requires):
         """Erase package from system"""
@@ -459,11 +469,11 @@ class CmdErase(Cmd):
             cmd.append('--auto-orphans')
         cmd += fullnames
 
-        subprocess.call(cmd)
+        return cmd
 
 
 class CmdRefresh(Cmd):
-    def cmd(self, args):
+    def _cmd(self, args):
         parser = argparse.ArgumentParser(prog='mpac refresh')
         parser.add_argument('name', help='media name', nargs='?')
         parser.add_argument('-A', '--include-disabled', action='store_true',
@@ -481,13 +491,13 @@ class CmdRefresh(Cmd):
         names = [m.name for m in media]
 
         if names:
-            subprocess.call(['urpmi.update'] + names)
+            return ['urpmi.update'] + names
         else:
-            subprocess.call(['urpmi.update', '-a'])
+            return ['urpmi.update', '-a']
 
 
 class CmdUpdate(Cmd):
-    def cmd(self, args):
+    def _cmd(self, args):
         parser = argparse.ArgumentParser(prog='mpac update')
         parser.add_argument('-R', '--no-refresh', action='store_true',
                             help='do not refresh package before update')
@@ -495,13 +505,13 @@ class CmdUpdate(Cmd):
         opt = parser.parse_args(args)
 
         if opt.no_refresh:
-            subprocess.call(['urpmi', '--auto-select'])
+            return ['urpmi', '--auto-select']
         else:
-            subprocess.call(['urpmi', '--auto-update'])
+            return ['urpmi', '--auto-update']
 
 
 class CmdList(Cmd):
-    def cmd(self, args):
+    def run(self, args):
         parser = argparse.ArgumentParser(prog='mpac list')
         parser.add_argument('name', nargs='?', help='media name')
         parser.add_argument('-a', '--all', action='store_true',
@@ -531,7 +541,7 @@ class CmdList(Cmd):
 
 
 class CmdAddMedia(Cmd):
-    def cmd(self, args):
+    def _cmd(self, args):
         parser = argparse.ArgumentParser(prog='mpac addmedia')
 
         parser.add_argument('medianame', nargs='?',
@@ -554,13 +564,13 @@ class CmdAddMedia(Cmd):
             args = ['--mirrorlist', opt.list]
         else:
             parser.print_help()
-            return
+            return None
 
-        subprocess.call(['urpmi.addmedia'] + args)
+        return ['urpmi.addmedia'] + args
 
 
 class CmdListMedia(Cmd):
-    def cmd(self, args):
+    def run(self, args):
         parser = argparse.ArgumentParser(prog='mpac listmedia')
         parser.add_argument('-a', '--all', action='store_true',
                             help='show all versions of packages')
@@ -584,7 +594,7 @@ class CmdListMedia(Cmd):
 
 
 class CmdModifyMedia(Cmd):
-    def cmd(self, args):
+    def run(self, args):
         parser = argparse.ArgumentParser(prog='mpac modifymedia')
         parser.add_argument('name', help='media name')
         group = parser.add_mutually_exclusive_group()
@@ -622,7 +632,7 @@ class CmdModifyMedia(Cmd):
 
 
 class CmdRemoveMedia(Cmd):
-    def cmd(self, args):
+    def _cmd(self, args):
         parser = argparse.ArgumentParser(prog='mpac removemedia')
         parser.add_argument('name', help='media name')
         parser.add_argument('-a', '--all', action='store_true',
@@ -631,10 +641,10 @@ class CmdRemoveMedia(Cmd):
         media = self._media.filter(opt.name)
 
         if opt.all:
-            subprocess.call(['urpmi.removemedia', '-a'])
+            return ['urpmi.removemedia', '-a']
         elif opt.name:
             names = [m.name for m in media]
-            subprocess.call(['urpmi.removemedia'] + names)
+            return ['urpmi.removemedia'] + names
 
 
 class Media(list):
