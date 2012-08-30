@@ -1,0 +1,957 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""a Mageia PACage manager
+
+Mpac is a package manager for Mageia, it tries to wrap around URPMI
+and provide a friendly interface.
+"""
+
+import re
+import sys
+import rpm
+import glob
+import gzip
+import fnmatch
+import os.path
+import sqlite3
+import argparse
+import subprocess
+
+DATABASE_FILE = os.path.expandvars('$HOME/.mpac.sqlite3')
+
+class Mpac(object):
+    STAT_INSTALLED = 1
+    STAT_NOT_INSTALLED = 2
+    STAT_UPGRADE_AVAILABLE = 3
+    STAT_DOWNGRADE_AVAILABLE = 4
+
+    def __init__(self, media):
+        self._media = media
+
+    def run(self):
+        cmd, args = self._parse_args(self._media)
+        cmd.func(args)
+
+    def _parse_args(self, media):
+        parser = argparse.ArgumentParser(add_help=False)
+
+        subparsers = parser.add_subparsers()
+
+        for ops, cmd in [(['search', 'se'], CmdSearch(media)),
+                         (['query', 'qu'], CmdQuery(media)),
+                         (['install', 'in'], CmdInstall(media)),
+                         (['erase', 'er'], CmdErase(media)),
+                         (['refresh', 're'], CmdRefresh(media)),
+                         (['update', 'up'], CmdUpdate(media)),
+                         (['list', 'li'], CmdList(media)),
+                         (['addmedia', 'am'], CmdAddMedia(media)),
+                         (['listmedia', 'lm'], CmdListMedia(media)),
+                         (['modifymedia', 'mm'], CmdModifyMedia(media)),
+                         (['removemedia', 'rm'], CmdRemoveMedia(media)),
+                          ]:
+            for op in ops:
+                subparsers.add_parser(op,
+                                      add_help=False).set_defaults(func=cmd.cmd)
+
+        return parser.parse_known_args()
+
+    @staticmethod
+    def print_pkg_list(pkgs, terse=False):
+        """Print out package information."""
+        try:
+            total_cols = int(subprocess.check_output(['tput', 'cols']))
+        except:
+            total_cols = 80
+
+        name_cols = version_cols = summary_cols = media_cols = 0
+
+        status_dict = { Mpac.STAT_INSTALLED: 'i',
+                        Mpac.STAT_NOT_INSTALLED: ' ',
+                        Mpac.STAT_UPGRADE_AVAILABLE: 'u',
+                        Mpac.STAT_DOWNGRADE_AVAILABLE: 'd',
+                        }
+
+        for pkg in pkgs:
+            pkg['version'] += '-' + pkg['release']
+            if pkg['status'] in [Mpac.STAT_UPGRADE_AVAILABLE,
+                                 Mpac.STAT_DOWNGRADE_AVAILABLE]:
+                pkg['version'] += '[%s]' % pkg['local_version']
+
+            name_cols = max(len(pkg['name']), name_cols)
+            version_cols = max(len(pkg['version']), version_cols)
+            summary_cols = max(len(pkg['summary']), summary_cols)
+            media_cols = max(len(pkg['media']), media_cols)
+
+        fmt = '{status} {name:%d}' % name_cols
+
+        if name_cols + version_cols + 3 > total_cols:
+            fmt += ' {version:%d}' % (total_cols - name_cols - 3)
+        else:
+            fmt += ' {version:%d}' % version_cols
+            if terse:
+                fmt += ' {media:%d}' % media_cols
+            else:
+                left_cols = name_cols + version_cols + 3
+                if name_cols + left_cols + 2 < total_cols * 7 / 8:
+                    cols = total_cols - left_cols - media_cols - 2
+                    fmt += ' {summary:%d.%d} {media:%d}' % (cols,
+                                                            cols, media_cols)
+                else:
+                    cols = total_cols - left_cols - 1
+                    fmt += ' {summary:%d.%d}' % (cols, cols)
+
+        for pkg in sorted(pkgs, key=lambda p: p['name']):
+            pkg['summary'] = pkg['summary']
+            pkg['status'] = status_dict[pkg['status']]
+            print fmt.format(**pkg)
+
+    @staticmethod
+    def merge_media_packages(lst, all_version=False):
+        "Merge list of media package lists into a single one."
+        if all_version:
+            all = []
+            for media, pkgs in lst:
+                for pkg in pkgs:
+                        # Convert sqlite3.Row to a normal dict before
+                        # assign item to it.
+                        p = dict(pkg)
+                        p['media'] = media.name
+                        all.append(p)
+            return all
+        else:
+            all = {}
+            for media, pkgs in lst:
+                for pkg in pkgs:
+                    if (pkg['name'] not in all
+                        or Mpac.rpm_version_cmp(pkg, all[pkg['name']])) > 0:
+                        all[pkg['name']] = dict(pkg)
+                        all[pkg['name']]['media'] = media.name
+            return all.values()
+
+    @staticmethod
+    def rpm_version_cmp(a, b):
+        """Compare two rpm versions.
+
+        RPM version comparison algorithm can be found at:
+          http://fedoraproject.org/wiki/Archive:Tools/RPM/VersionComparison
+
+        Here we use rpm.labelCompare().
+
+        Epoch returned from dbMatch() may be a `long` number or
+        `None`, so convert it to string before passing to
+        labelCompare().
+        """
+        a_epoch = str(a['epoch']) if a['epoch'] else '0'
+        b_epoch = str(b['epoch']) if b['epoch'] else '0'
+        return rpm.labelCompare((a_epoch, a['version'], a['release']),
+                                (b_epoch, b['version'], b['release']))
+
+    @staticmethod
+    def query_installed(name):
+        """Return latest version of the installed matched package."""
+        ts = rpm.TransactionSet()
+
+        pkg = None
+        for m in ts.dbMatch('name', name):
+            if not pkg or Mpac.rpm_version_cmp(m, pkg) > 0:
+                pkg = m
+
+        return pkg
+
+
+    @staticmethod
+    def set_rpm_status(pkgs):
+        """Query from rpm database and set package status."""
+        for pkg in pkgs:
+            local = Mpac.query_installed(pkg['name'])
+            if not local:
+                pkg['status'] = Mpac.STAT_NOT_INSTALLED
+            else:
+                r = Mpac.rpm_version_cmp(local, pkg)
+                if r == 0:
+                    pkg['status'] = Mpac.STAT_INSTALLED
+                else:
+                    if r < 0:
+                        pkg['status'] = Mpac.STAT_UPGRADE_AVAILABLE
+                    else:
+                        pkg['status'] = Mpac.STAT_DOWNGRADE_AVAILABLE
+                    pkg['local_version'] = (
+                        local['version'] + '-' + local['release'])
+
+
+class Cmd():
+    def __init__(self, media):
+        self._media = media
+
+    def cmd(self, args):
+        raise NotImplementedError
+
+class CmdSearch(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac search')
+        parser.add_argument('pattern')
+        parser.add_argument('-a', '--all', action='store_true',
+                            help='show all versions of matched packages')
+        parser.add_argument('-A', '--include-disabled', action='store_true',
+                            help='also search in disabled media')
+        parser.add_argument('-e', '--exact', action='store_true',
+                            help='using exact match instead of sub-string')
+        parser.add_argument('-f', '--files', action='store_true',
+                            help='search file instead of name and summary')
+        parser.add_argument('-m', '--media', help='search specific media')
+        parser.add_argument('-n', '--names-only', action='store_true',
+                            help='search package names only')
+        parser.add_argument('-p', '--provides', action='store_true',
+                            help='search which package provides it')
+        parser.add_argument('-r', '--requires', action='store_true',
+                            help='search which package requires it')
+        parser.add_argument('-t', '--terse', action='store_true',
+                            help='display a terse view')
+        opt = parser.parse_args(args)
+
+        if opt.include_disabled:
+            media = self._media
+        else:
+            media = self._media.enabled
+
+        if opt.media:
+            media = media.filter(opt.media)
+
+        if opt.files:
+            self._search_other(media, '--files', opt.pattern)
+        elif opt.provides:
+            self._search_other(media, '--provides', opt.pattern)
+        elif opt.requires:
+            self._search_other(media, '--requires', opt.pattern)
+        else:
+            media.update_db()
+
+            self._search(media, opt.pattern,
+                         opt.all, opt.names_only, opt.terse, opt.exact)
+
+    def _search(self, media, pattern, all, names_only, terse, exact):
+        """Search packages in database.
+
+        @all: show all matched version or the highest one
+        @names_only: match names only or also with summary text
+        @terse: do a terse disply or not
+
+        If there are no wildcard characters in pattern, we prepend and
+        append prepend `*` to it to make it as a sub-string match.
+        """
+        if not exact and not media.pattern_has_wildcard(pattern):
+            if '=' in pattern:
+                n, v = pattern.split('=', 1)
+                pattern = '*%s*=%s' % (n, v)
+            else:
+                pattern = '*%s*' % pattern
+
+        pkgs = Mpac.merge_media_packages(media.query(pattern, names_only), all)
+        Mpac.set_rpm_status(pkgs)
+        Mpac.print_pkg_list(pkgs, terse)
+
+    def _search_other(self, media, option, pattern):
+        """Search files and other stuff in database.
+
+        Urpmf accept regular expressions, but to be consistant of
+        other commands, here we replace `?` and `.` with corresponding
+        regexp stuff.
+
+        TODO: urpmf have many other useful searches, they should also
+              be wrapped.
+        """
+        if media.pattern_has_wildcard(pattern):
+            pattern = '^%s$' % re.escape(
+                pattern).replace('\\?', '.').replace('\\*', '.*')
+
+        if media:
+            names = ','.join(m.name for m in media)
+            subprocess.call(['urpmf', '--media'] + [names, option, pattern])
+        else:
+            subprocess.call(['urpmf', option, pattern])
+
+
+class CmdQuery(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac query')
+        parser.add_argument('name', help='package name')
+        parser.add_argument('-a', '--all', action='store_true',
+                            help='show all versions of matched packages')
+
+        parser.add_argument('-c', '--changelog', action='store_true',
+                            help='print changelog of this package')
+        parser.add_argument('-C', '--conflicts', action='store_true',
+                            help='print conflicts of this package')
+        parser.add_argument('-o', '--obsoletes', action='store_true',
+                            help='print obsoletes of this package')
+        parser.add_argument('-p', '--provides', action='store_true',
+                            help='print provides of this package')
+        parser.add_argument('-r', '--requires', action='store_true',
+                            help='print requires of this package')
+        parser.add_argument('-R', '--requires-recursive', action='store_true',
+                            help='print requires of this package recursively')
+        parser.add_argument('-s', '--suggests', action='store_true',
+                            help='print suggests of this package')
+
+        parser.add_argument('-m', '--media', help='search specific media')
+        parser.add_argument('-A', '--include-disabled', action='store_true',
+                            help='also search in disabled media')
+        opt = parser.parse_args(args)
+
+        if opt.include_disabled:
+            media = self._media
+        else:
+            media = self._media.enabled
+
+        options = []
+        if opt.changelog:
+            options.append('--changelog')
+        if opt.conflicts:
+            options.append('--conflicts')
+        if opt.obsoletes:
+            options.append('--obsoletes')
+        if opt.provides:
+            options.append('--provides')
+        if opt.requires:
+            options.append('--requires')
+        if opt.requires_recursive:
+            options.append('--requires-recursive')
+        if opt.suggests:
+            options.append('--suggests')
+
+        if opt.media:
+            media = media.filter(opt.media)
+
+        media.update_db()
+
+        self._query(media, opt.name, opt.all, options)
+
+    def _query(self, media, pattern, all, options):
+        """Print details of packages match `pattern` in `media`.
+
+        `urpmq -i` will do fuzzy query for package name and media
+        name, to suppress this feature, we firstly do a database
+        query, and then pass exact package and media name to it.
+
+        XXX: There may still be some circumstances that more entries
+             than expected will be printed.
+        """
+        pkgs = Mpac.merge_media_packages(media.query(pattern), all)
+        if not pkgs:
+            print >>sys.stderr, "No package named %s." % pattern
+        else:
+            for pkg in pkgs:
+                output = 'Medium      : %s\n' % pkg['media']
+                if options:
+                    output += 'Package     : %s\n\n' % pkg['full_name']
+                    o = options
+                else:
+                    o = options + ['-i']
+                output += subprocess.check_output(['urpmq',
+                                                   '--searchmedia',
+                                                   pkg['media'],
+                                                   pkg['full_name']] + o)
+                print output.strip()
+                print
+
+
+class CmdInstall(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac install')
+        parser.add_argument('name', nargs='+', help='package name(s)')
+        parser.add_argument('-d', '--download-only', action='store_true',
+                            help='download packages without install')
+        parser.add_argument('-p', '--provides', action='store_true',
+                            help='install by provides instead of package name')
+        parser.add_argument('-S', '--no-suggests', action='store_true',
+                            help='do not install suggests packages')
+        parser.add_argument('-m', '--media', help='search specific media')
+        parser.add_argument('-A', '--include-disabled', action='store_true',
+                            help='also search in disabled media')
+
+        opt = parser.parse_args(args)
+
+        # If name(s) is a file path or url, bypass all checks and run
+        # urpmi directly.
+        if (any(n.endswith('.rpm') for n in opt.name)
+            or opt.provides):
+            subprocess.call(['urpmi'] + opt.name)
+            return
+
+        if opt.include_disabled:
+            media = self._media
+        else:
+            media = self._media.enabled
+
+        options = []
+        if opt.download_only:
+            options.append('--no-install')
+        if opt.no_suggests:
+            options.append('--no-suggests')
+
+        if opt.media:
+            media = media.filter(opt.media)
+
+        media.update_db()
+
+        self._install(media, opt.name, options)
+
+    def _install(self, media, names, options):
+        """Install package from media.
+
+        Several packages may be matched, here we query their name
+        firstly, and them supply all the names and media names to
+        `urpmi`.
+        """
+        pkgs = []
+        for name in names:
+            pkgs += Mpac.merge_media_packages(media.query(name))
+
+        if not pkgs:
+            print >>sys.stderr, 'No package named "%s" found.' % name
+            return
+
+        names = [p['full_name'] for p in pkgs]
+        media = [p['media'] for p in pkgs]
+
+        subprocess.call(['urpmi',
+                         '--searchmedia', ','.join(media)] + options + names)
+
+
+class CmdErase(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac erase')
+        parser.add_argument('name', nargs='+', help='package name')
+        parser.add_argument('-r', '--requires', action='store_true',
+                            help='also remove its requires if possiable')
+
+        opt = parser.parse_args(args)
+
+        self._erase(opt.name, opt.requires)
+
+    def _erase(self, names, requires):
+        """Erase package from system"""
+        fullnames = []
+
+        ts = rpm.TransactionSet()
+        for name in names:
+            res = []
+            if '=' in name:
+                name, version = name.split('=', 1)
+            else:
+                version = None
+            mi = ts.dbMatch()
+            mi.pattern('name', rpm.RPMMIRE_GLOB, name)
+            for h in mi:
+                if not version or version in h['version'] + '-' + h['release']:
+                    res.append('%s-%s-%s' % (
+                        h['name'], h['version'], h['release']))
+            if not res:
+                print >>sys.stderr, 'No package named "%s" installed.' % name
+            fullnames += res
+
+        if not fullnames:
+            return
+
+        cmd = ['urpme']
+        if requires:
+            cmd.append('--auto-orphans')
+        cmd += fullnames
+
+        subprocess.call(cmd)
+
+
+class CmdRefresh(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac refresh')
+        parser.add_argument('name', help='media name', nargs='?')
+        parser.add_argument('-A', '--include-disabled', action='store_true',
+                            help='refresh both enabled and disabled media')
+        opt = parser.parse_args(args)
+
+        if opt.include_disabled:
+            media = self._media
+        else:
+            media = self._media.enabled
+
+        if opt.name:
+            media = media.filter(opt.name)
+
+        names = [m.name for m in media]
+
+        if names:
+            subprocess.call(['urpmi.update'] + names)
+        else:
+            subprocess.call(['urpmi.update', '-a'])
+
+
+class CmdUpdate(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac update')
+        parser.add_argument('-R', '--no-refresh', action='store_true',
+                            help='do not refresh package before update')
+
+        opt = parser.parse_args(args)
+
+        if opt.no_refresh:
+            subprocess.call(['urpmi', '--auto-select'])
+        else:
+            subprocess.call(['urpmi', '--auto-update'])
+
+
+class CmdList(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac list')
+        parser.add_argument('name', nargs='?', help='media name')
+        parser.add_argument('-a', '--all', action='store_true',
+                            help='show all versions of packages')
+        parser.add_argument('-t', '--terse', action='store_true',
+                            help='display a terse view')
+        parser.add_argument('-A', '--include-disabled', action='store_true',
+                            help='also search in disabled media')
+        opt = parser.parse_args(args)
+
+        if opt.include_disabled:
+            media = self._media
+        else:
+            media = self._media.enabled
+
+        if opt.name:
+            media = media.filter(opt.name)
+
+        media.update_db()
+
+        self._list(media, opt.all, opt.terse)
+
+    def _list(self, media, all, terse):
+        pkgs = Mpac.merge_media_packages(media.list_all(), all)
+        Mpac.set_rpm_status(pkgs)
+        Mpac.print_pkg_list(pkgs, terse)
+
+
+class CmdAddMedia(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac addmedia')
+
+        parser.add_argument('medianame', nargs='?',
+                            help='name of the media to be added')
+        parser.add_argument('url', nargs='?',
+                            help='url of the media to be added')
+        parser.add_argument('-m', '--mirror',
+                            help='add a group of media reside in mirror')
+        parser.add_argument('-l', '--list',
+                            help='automatically choose a mirror')
+
+        opt = parser.parse_args(args)
+
+        args = []
+        if opt.medianame and opt.url:
+            args = [opt.media_name, opt.url]
+        elif opt.mirror:
+            args = ['--mirror', opt.mirror]
+        elif opt.list:
+            args = ['--mirrorlist', opt.list]
+        else:
+            parser.print_help()
+            return
+
+        subprocess.call(['urpmi.addmedia'] + args)
+
+
+class CmdListMedia(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac listmedia')
+        parser.add_argument('-a', '--all', action='store_true',
+                            help='show all versions of packages')
+        opt = parser.parse_args(args)
+
+        if opt.all:
+            media = self._media
+        else:
+            media = self._media.enabled
+
+        name_cols = 0
+        for m in media:
+            name_cols = max(len(m.name), name_cols)
+
+        for m in media:
+            if opt.all:
+                flag = '+' if m.enabled else ' '
+                print ('{} {:%d} {}' % name_cols).format(flag, m.name, m.url)
+            else:
+                print ('{:%d} {}' % name_cols).format(m.name, m.url)
+
+
+class CmdModifyMedia(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac modifymedia')
+        parser.add_argument('name', help='media name')
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument('-e', '--enable', action='store_true',
+                           help='enable a media')
+        group.add_argument('-d', '--disable', action='store_true',
+                           help='disable a media')
+        opt = parser.parse_args(args)
+
+        enabled = self._media.enabled.filter(opt.name, False)
+        disabled = self._media.disabled.filter(opt.name, False)
+
+        if opt.enable:
+            if not disabled:
+                print >>sys.stderr, "no media matched"
+            for m in disabled:
+                try:
+                    subprocess.check_call([
+                        'urpmi.update', '--no-ignore', m.name])
+                    print 'medium "%s" enabled' % m.name
+                except:
+                    pass
+        elif opt.disable:
+            if not enabled:
+                print >>sys.stderr, "no media matched"
+            for m in enabled:
+                try:
+                    subprocess.check_call([
+                        'urpmi.update', '--ignore', m.name])
+                    print 'medium "%s" disabled' % m.name
+                except:
+                    pass
+        else:
+            print >>sys.stderr, 'Please specify --enable or --disable.'
+
+
+class CmdRemoveMedia(Cmd):
+    def cmd(self, args):
+        parser = argparse.ArgumentParser(prog='mpac removemedia')
+        parser.add_argument('name', help='media name')
+        parser.add_argument('-a', '--all', action='store_true',
+                            help='remove all matched media')
+        opt = parser.parse_args(args)
+        media = self._media.filter(opt.name)
+
+        if opt.all:
+            subprocess.call(['urpmi.removemedia', '-a'])
+        elif opt.name:
+            names = [m.name for m in media]
+            subprocess.call(['urpmi.removemedia'] + names)
+
+
+class Media(list):
+    """Media represent all media configured in Mageia."""
+    def __init__(self, db):
+        list.__init__(self)
+        self._db = db
+
+    @property
+    def enabled(self):
+        """Return all enabled media."""
+        media = Media(db)
+        for m in self:
+            if m.enabled:
+                media.append(m)
+        return media
+
+    @property
+    def disabled(self):
+        """Return all disabled media."""
+        media = Media(db)
+        for m in self:
+            if not m.enabled:
+                media.append(m)
+        return media
+
+    def filter(self, pattern, warning=True):
+        """Filter media using pattern.
+
+        Return a new Media instance.
+        """
+        if not pattern or not pattern.strip():
+            return self
+
+        # doing a case-insensitive match
+        pattern = pattern.strip().lower()
+        media = Media(self._db)
+        media += filter(lambda m:fnmatch.fnmatch(m.name.lower(), pattern), self)
+
+        if not media and warning:
+            print >>sys.stderr, 'No media name matches "%s".' % pattern
+
+        return media
+
+    def list_all(self):
+        """List all packages of media."""
+        res = []
+        for m in self:
+            res.append([m, m.list_pkgs(self._db)])
+        return res
+
+    def pattern_has_wildcard(self, pattern):
+        """Test if there are wildcard characters in the pattern."""
+        return '*' in pattern or '?' in pattern
+
+    def query(self, pattern, names_only=True):
+        """Query packages from database.
+
+        Pattern may contain version and release number, e.g.
+           rpm=4.9.1.3
+
+        If there are wildcard characters in pattern, a fuzzy search
+        will be performed. Version part is tested using `beginswith`.
+        """
+        res = []
+        cursor = self._db.cursor()
+
+        if '=' in pattern:
+            pattern, version = pattern.split('=', 1)
+        else:
+            version = None
+
+        if self.pattern_has_wildcard(pattern):
+            pattern = self._convert_pattern(pattern)
+            cmp_op = 'LIKE'
+        else:
+            cmp_op = '='
+
+        for m in self:
+            if names_only:
+                cursor.execute('''
+                  SELECT * FROM packages_%s
+                  WHERE name %s ? ORDER BY name''' % (m.id, cmp_op), (pattern,))
+            else:
+                cursor.execute('''
+                  SELECT * FROM packages_%s
+                  WHERE name %s ? OR summary %s ? ORDER BY name''' % (
+                      m.id, cmp_op, cmp_op), (pattern, pattern))
+            pkgs = []
+            for pkg in cursor.fetchall():
+                if not version or (pkg['version'] +
+                                   '-'+ pkg['release']).startswith(version):
+                    pkgs.append(pkg)
+            res.append([m, pkgs])
+
+        return res
+
+    def update_db(self):
+        """Update package info in database of all enabled media."""
+        if not all(m.mtime for m in self):
+            if all(m.enabled for m in self):
+                cmd = 'mpac refresh'
+            else:
+                cmd = 'mpac refresh -A'
+            print >>sys.stderr, "Please run `%s` to refresh package list." % cmd
+            sys.exit(1)
+
+        for m in self:
+            m.update_db(self._db)
+
+    def _convert_pattern(self, pattern):
+        """Convert a limited glob pattern into format of sqlite3."""
+        return pattern.replace('_', '\\_').replace('*', '%').replace('?', '_')
+
+
+class Medium(object):
+    """Medium represent a Mageia medium."""
+    def __init__(self, name, url, options):
+        self.enabled = ('ignore' not in options)
+        self.id = self._gen_id(url)
+        self.name = name
+        self.path = self._synthesis_file_path(name)
+        self.url = url
+
+        if os.path.exists(self.path):
+            self.mtime = os.path.getmtime(self.path)
+        else:
+            self.mtime = None
+
+    def __repr__(self):
+        return '<Medium %s>' % self.name
+
+    def list_pkgs(self, db):
+        """List all packages in this medium."""
+        cr = db.cursor()
+        cr.execute('SELECT * FROM packages_%s ORDER BY name' % self.id)
+        return cr.fetchall()
+
+    def update_db(self, db):
+        """Update database if data is stale."""
+        if self._db_is_stale(db, self.id, self.mtime):
+            self._update(db, self.id, self.mtime, self.path)
+
+    def _db_is_stale(self, db, id, mtime):
+        """Test if package info in database is stale or not."""
+        cr = db.cursor()
+
+        cr.execute('SELECT mtime FROM media WHERE id = ?', (id, ))
+
+        row = cr.fetchone()
+
+        if not row:
+            cr.execute('INSERT INTO media VALUES (?, ?)', (id, 0))
+            db.commit()
+            return True
+
+        return row[0] < mtime
+
+    def _gen_id(self, url):
+        """Generate an id for that medium.
+
+        Here we extract part of the medium url as this medium's
+        id. Comparing to name of the medium, url is much more
+        structured, so it is more suitable to be used as a table name
+        in database.
+        """
+        idx0 = url.rindex('/media/')
+        idx = url.rindex('/', 0, idx0)
+        # replace all abnormal characters if has any
+        return re.sub(r'\W', '_', url[idx:])
+
+    def _parse_pkg_info(self, path):
+        """Parse package info of this medium from its synthesis file.
+
+        Each package may have several corresponding lines in synthesis
+        file and contain its infomation, namely `provides`,
+        `conflicts`, `obsoletes`, `requires`, `suggests`, `summary`,
+        `filesize` and `info`. Only `info` section is mandatory and
+        will always come at last. Here we only care about `summary`
+        and `info`.
+
+        More info about synthesis file format can be found at
+        perl-URPM package, e.g. build_synthesis() in URPM/Build.pm and
+        Pkg_build_info() in URPM.xs.
+        """
+        summary = None
+        pkgs = []
+        for line in gzip.open(path):
+            if not line or line[0] != '@':
+                continue
+
+            fields = line[1:].strip().split('@')
+
+            if not fields:
+                continue
+
+            section = fields[0]
+
+            if section == 'summary':
+                summary = fields[1]
+            elif section == 'info':
+                p = { 'summary': summary }
+                summary = None
+                p['full_name'], p['epoch'], p['size'], p['group'] = fields[1:]
+                p.update(self._split_full_name(p['full_name']))
+                pkgs.append(p)
+
+        return pkgs
+
+
+    def _split_full_name(self, full_name):
+        """Split a package's full name to seperate parts.
+
+           Split a full name into four parts: name, version, release and arch.
+
+           e.g. `rpm-4.9.1.3-2.mga2.i586` will be splitted into:
+                 rpm (name), 4.9.1.3 (version), 2.mga2 (release), i586 (arch)
+
+           XXX: Algorithm used here may be not correct.
+        """
+        pkg = {}
+        fields = full_name.split('-')
+
+        sub_fields = fields.pop().split('.')
+        pkg['arch'] = sub_fields.pop()
+        pkg['release'] = '.'.join(sub_fields)
+
+        pkg['version'] = fields.pop()
+        pkg['name'] = '-'.join(fields)
+
+        return pkg
+
+    def _synthesis_file_path(self, name):
+        """Synthesis file path of a medium.
+
+        XXX: These two pathes used here may be both valid, how does
+             urpmi choose synthesis file path?
+        """
+        path = "/var/lib/urpmi/synthesis.hdlist.%s.cz" % name
+        if not os.path.exists(path):
+            path = "/var/lib/urpmi/%s/synthesis.hdlist.cz" % name
+        return path
+
+    def _update(self, db, id, mtime, path):
+        """Read info from synthesis file and insert them into database.
+
+        After insertion, mtime in media table should also be updated.
+        """
+        table = 'packages_' + id
+
+        cr = db.cursor()
+
+        cr.execute('''CREATE TABLE IF NOT EXISTS %s (
+          full_name TEXT,
+          name TEXT, version TEXT, release TEXT, arch TEXT,
+          epoch TEXT, summary TEXT, size INT, `group` TEXT )''' % table)
+
+        for pkg in self._parse_pkg_info(path):
+            cr.execute('''INSERT INTO %s VALUES (
+              :full_name,
+              :name, :version, :release, :arch,
+              :epoch, :summary, :size, :group )''' % table, pkg)
+
+        cr.execute('UPDATE media SET mtime = ? WHERE id = ?', (mtime, id))
+
+        db.commit()
+
+
+class UrpmiConfig(object):
+    """Parse URPMI configures from urpmi.cfg.
+
+       See urpmi.cfg(5) for more info.
+    """
+    def parse(self):
+        rex = re.compile(r'(.*?){$(.*?)^}', re.MULTILINE|re.DOTALL)
+
+        media = []
+        for match in rex.findall(open('/etc/urpmi/urpmi.cfg').read()):
+            fields = match[0].strip().rsplit(None, 1)
+
+            if not fields:
+                # global config
+                self.config = self._parse_options(match[1])
+            else:
+                name = fields[0].replace('\\', '')
+                url = fields[1]
+                options = self._parse_options(match[1])
+                media.append(Medium(name, url, options))
+        return media
+
+    def _parse_options(self, content):
+        return [line.strip() for line in content.strip().splitlines()]
+
+
+def init_database():
+    """Init sqlite database, and create table `media` if not exists."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row
+    # Summary of some packages contain non-ascii characters, so here
+    # we should set conn.text_factory to `str`.
+    conn.text_factory = str
+    cr = conn.cursor()
+    cr.execute('''CREATE TABLE IF NOT EXISTS media (
+      id TEXT PRIMARY KEY, mtime INT)''')
+    conn.commit()
+    return conn
+
+
+if __name__ == '__main__':
+    cfg = UrpmiConfig()
+    db = init_database()
+    media = Media(db)
+
+    for m in cfg.parse():
+        media.append(m)
+
+    try:
+        Mpac(media).run()
+    except KeyboardInterrupt:
+        sys.exit(1)
