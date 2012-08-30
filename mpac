@@ -656,7 +656,7 @@ class Media(list):
     @property
     def enabled(self):
         """Return all enabled media."""
-        media = Media(db)
+        media = Media(self._db)
         for m in self:
             if m.enabled:
                 media.append(m)
@@ -665,7 +665,7 @@ class Media(list):
     @property
     def disabled(self):
         """Return all disabled media."""
-        media = Media(db)
+        media = Media(self._db)
         for m in self:
             if not m.enabled:
                 media.append(m)
