@@ -19,6 +19,8 @@ import argparse
 import subprocess
 
 DATABASE_FILE = os.path.expandvars('$HOME/.mpac.sqlite3')
+URPMI_CONFIG_FILE = '/etc/urpmi/urpmi.cfg'
+URPMI_DATA_DIR = '/var/lib/urpmi/'
 
 class Mpac(object):
     STAT_INSTALLED = 1
@@ -883,9 +885,9 @@ class Medium(object):
         XXX: These two pathes used here may be both valid, how does
              urpmi choose synthesis file path?
         """
-        path = "/var/lib/urpmi/synthesis.hdlist.%s.cz" % name
+        path = os.path.join(URPMI_DATA_DIR, "synthesis.hdlist.%s.cz" % name)
         if not os.path.exists(path):
-            path = "/var/lib/urpmi/%s/synthesis.hdlist.cz" % name
+            path = os.path.join(URPMI_DATA_DIR, name, "synthesis.hdlist.cz")
         return path
 
     def _update(self, db, id, mtime, path):
@@ -922,7 +924,7 @@ class UrpmiConfig(object):
         rex = re.compile(r'(.*?){$(.*?)^}', re.MULTILINE|re.DOTALL)
 
         media = []
-        for match in rex.findall(open('/etc/urpmi/urpmi.cfg').read()):
+        for match in rex.findall(open(URPMI_CONFIG_FILE).read()):
             fields = match[0].strip().rsplit(None, 1)
 
             if not fields:
