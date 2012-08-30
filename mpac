@@ -547,7 +547,7 @@ class CmdAddMedia(Cmd):
 
         args = []
         if opt.medianame and opt.url:
-            args = [opt.media_name, opt.url]
+            args = [opt.medianame, opt.url]
         elif opt.mirror:
             args = ['--mirror', opt.mirror]
         elif opt.list:
