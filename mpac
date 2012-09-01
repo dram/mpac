@@ -534,12 +534,12 @@ class CmdList(Cmd):
 
         media.update_db()
 
-        self._list(media, opt.all, opt.terse)
+        Mpac.print_pkg_list(self._list(media, opt.all), opt.terse)
 
-    def _list(self, media, all, terse):
+    def _list(self, media, all):
         pkgs = Mpac.merge_media_packages(media.list_all(), all)
         Mpac.set_rpm_status(pkgs)
-        Mpac.print_pkg_list(pkgs, terse)
+        return pkgs
 
 
 class CmdAddMedia(Cmd):
